@@ -217,9 +217,9 @@ async def get_status():
 # CORRECTED: Run with the exact filename
 if __name__ == "__main__":
     uvicorn.run(
-        "fastapi_:app",  # This matches your filename fastapi_.py
-        host="0.0.0.0", 
-        port=8000, 
+        "fastapi_:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),  # ✅ use Render's port
         reload=True,
         log_level="info"
     )
