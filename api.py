@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 import requests
 import tempfile
@@ -88,12 +89,12 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS
+# Enhanced CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Update in production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],  # Explicitly include HEAD and OPTIONS
     allow_headers=["*"],
 )
 
@@ -109,8 +110,15 @@ class VideoProcessor:
             print(f"📥 Downloading video from: {video_url}")
             temp_dir = tempfile.mkdtemp()
             temp_file = os.path.join(temp_dir, "temp_video.mp4")
-            response = requests.get(video_url, stream=True, timeout=30)
+            
+            # Add headers to mimic browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(video_url, stream=True, timeout=60, headers=headers)
             response.raise_for_status()
+            
             with open(temp_file, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -136,17 +144,51 @@ class VideoProcessor:
 video_processor = VideoProcessor()
 
 # -----------------------
+# Exception handlers
+# -----------------------
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": "Endpoint not found",
+            "available_endpoints": [
+                "GET /",
+                "GET /health",
+                "POST /predict",
+                "GET /status",
+                "GET /docs"
+            ]
+        }
+    )
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)}
+    )
+
+# -----------------------
 # Routes
 # -----------------------
 @app.get("/", tags=["Health"])
+@app.head("/", tags=["Health"])  # Add HEAD method support
 async def root():
     return {
         "message": "Vital Signs Prediction API",
         "status": "running",
-        "model_loaded": vital_signs_predictor is not None
+        "model_loaded": vital_signs_predictor is not None,
+        "endpoints": {
+            "predict": "/predict (POST)",
+            "health": "/health (GET)",
+            "status": "/status (GET)",
+            "docs": "/docs (GET)"
+        }
     }
 
 @app.get("/health", tags=["Health"])
+@app.head("/health", tags=["Health"])  # Add HEAD method support
 async def health_check():
     return {
         "status": "healthy" if vital_signs_predictor else "unhealthy",
@@ -155,25 +197,49 @@ async def health_check():
 
 @app.post("/predict", response_model=VitalSignsResponse, tags=["Prediction"])
 async def predict_vital_signs(request: VitalSignsRequest, background_tasks: BackgroundTasks):
+    """
+    Predict vital signs from video URL
+    
+    - **video_url**: Direct URL to video file (mp4, avi, mov, webm)
+    - **age**: Person's age (1-120, default: 25)
+    - **gender**: Person's gender (M/F, default: M)
+    """
     if not vital_signs_predictor:
-        raise HTTPException(status_code=503, detail="Predictor not initialized")
+        raise HTTPException(
+            status_code=503, 
+            detail="Predictor not initialized. Please try again later."
+        )
+    
     temp_file_path = None
     try:
+        print(f"🔄 Processing prediction request for URL: {request.video_url}")
+        
+        # Validate video URL
+        if not request.video_url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="Invalid video URL format")
+        
         # Download video
         temp_file_path = await video_processor.download_video(request.video_url)
         
         # Predict vitals
         import time
         start_time = time.time()
+        print(f"🔍 Starting prediction with age={request.age}, gender={request.gender}")
+        
         results = vital_signs_predictor.predict_from_video(
             temp_file_path,
             request.age,
             request.gender
         )
-        results['processing_time'] = round(time.time() - start_time, 2)
         
-        # Cleanup
+        processing_time = round(time.time() - start_time, 2)
+        results['processing_time'] = processing_time
+        
+        print(f"✅ Prediction completed in {processing_time}s")
+        
+        # Schedule cleanup
         background_tasks.add_task(video_processor.cleanup_temp_file, temp_file_path)
+        
         return VitalSignsResponse(**results)
     
     except HTTPException:
@@ -181,30 +247,67 @@ async def predict_vital_signs(request: VitalSignsRequest, background_tasks: Back
             background_tasks.add_task(video_processor.cleanup_temp_file, temp_file_path)
         raise
     except Exception as e:
+        print(f"❌ Prediction error: {str(e)}")
         if temp_file_path:
             background_tasks.add_task(video_processor.cleanup_temp_file, temp_file_path)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Prediction failed: {str(e)}"
+        )
 
 @app.get("/status", tags=["Status"])
 async def get_status():
+    """Get API status and capabilities"""
     if not vital_signs_predictor:
-        return {"status": "Model not loaded"}
+        return {
+            "status": "Model not loaded",
+            "error": "Predictor initialization failed"
+        }
     return {
         "status": "Ready",
         "model_loaded": True,
         "supported_formats": ["mp4", "avi", "mov", "webm"],
         "max_video_size": "100MB (recommended)",
-        "min_frames_required": 30
+        "min_frames_required": 30,
+        "api_version": "1.0.0"
+    }
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle preflight OPTIONS requests"""
+    return JSONResponse(
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+# Add a test endpoint for debugging
+@app.get("/test", tags=["Debug"])
+async def test_endpoint():
+    """Test endpoint for debugging"""
+    return {
+        "message": "Test endpoint working",
+        "predictor_status": vital_signs_predictor is not None,
+        "environment": {
+            "PORT": os.environ.get("PORT", "Not set"),
+            "python_version": sys.version,
+        }
     }
 
 # -----------------------
 # Run app
 # -----------------------
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Starting server on port {port}")
     uvicorn.run(
-        "api:app",           # ✅ matches filename api.py
+        "api:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        reload=False,        # ✅ production-ready
-        log_level="info"
+        port=port,
+        reload=False,
+        log_level="info",
+        access_log=True
     )
