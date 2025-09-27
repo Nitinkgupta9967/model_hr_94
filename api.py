@@ -6,9 +6,15 @@ import requests
 import tempfile
 import os
 import sys
+import gc
+import logging
 from typing import Optional
 import uvicorn
 from contextlib import asynccontextmanager
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -16,10 +22,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Import VitalSigns class
 try:
     from predict_vitals import VitalSigns
-    print("✅ Successfully imported VitalSigns")
+    logger.info("Successfully imported VitalSigns")
 except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print("Make sure predict_vitals.py is in the same directory")
+    logger.error(f"Import error: {e}")
+    logger.error("Make sure predict_vitals.py is in the same directory")
     sys.exit(1)
 
 import numpy as np
@@ -56,10 +62,10 @@ class VitalSignsResponse(BaseModel):
     error: Optional[str]
     processing_time: Optional[float]
 
-class ProcessingStatus(BaseModel):
+class HealthResponse(BaseModel):
     status: str
-    message: str
-    progress: Optional[int] = None
+    model_loaded: bool
+    message: Optional[str] = None
 
 # -----------------------
 # Global predictor
@@ -69,15 +75,19 @@ vital_signs_predictor = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global vital_signs_predictor
-    print("🚀 Initializing Vital Signs Predictor...")
+    logger.info("Initializing Vital Signs Predictor...")
     try:
         vital_signs_predictor = VitalSigns()
-        print("✅ Vital Signs Predictor initialized successfully")
+        logger.info("Vital Signs Predictor initialized successfully")
+        
+        # Force garbage collection after initialization
+        gc.collect()
+        
     except Exception as e:
-        print(f"❌ Failed to initialize predictor: {e}")
+        logger.error(f"Failed to initialize predictor: {e}")
         vital_signs_predictor = None
     yield
-    print("🛑 Shutting down...")
+    logger.info("Shutting down...")
 
 # -----------------------
 # FastAPI app
@@ -92,9 +102,9 @@ app = FastAPI(
 # Enhanced CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update in production
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],  # Explicitly include HEAD and OPTIONS
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -105,28 +115,39 @@ class VideoProcessor:
     """Helper class to handle video download and cleanup"""
     
     async def download_video(self, video_url: str) -> str:
-        """Download video from Cloudinary URL to temporary file"""
+        """Download video from URL to temporary file"""
         try:
-            print(f"📥 Downloading video from: {video_url}")
+            logger.info(f"Downloading video from: {video_url}")
             temp_dir = tempfile.mkdtemp()
             temp_file = os.path.join(temp_dir, "temp_video.mp4")
             
-            # Add headers to mimic browser request
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
-            response = requests.get(video_url, stream=True, timeout=60, headers=headers)
+            response = requests.get(
+                video_url, 
+                stream=True, 
+                timeout=120,  # Increased timeout
+                headers=headers
+            )
             response.raise_for_status()
             
+            # Write video file in chunks
             with open(temp_file, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"✅ Video downloaded to: {temp_file}")
+                    if chunk:
+                        f.write(chunk)
+            
+            file_size = os.path.getsize(temp_file)
+            logger.info(f"Video downloaded successfully. Size: {file_size / 1024 / 1024:.2f} MB")
             return temp_file
+            
         except requests.RequestException as e:
+            logger.error(f"Failed to download video: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Failed to download video: {str(e)}")
         except Exception as e:
+            logger.error(f"Error downloading video: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error downloading video: {str(e)}")
 
     def cleanup_temp_file(self, file_path: str):
@@ -137,9 +158,13 @@ class VideoProcessor:
                 temp_dir = os.path.dirname(file_path)
                 if os.path.exists(temp_dir) and not os.listdir(temp_dir):
                     os.rmdir(temp_dir)
-                print(f"🗑️ Cleaned up temporary file: {file_path}")
+                logger.info(f"Cleaned up temporary file: {file_path}")
+                
+                # Force garbage collection after cleanup
+                gc.collect()
+                
         except Exception as e:
-            print(f"⚠️ Warning: Could not clean up temp file {file_path}: {e}")
+            logger.warning(f"Could not clean up temp file {file_path}: {e}")
 
 video_processor = VideoProcessor()
 
@@ -164,6 +189,7 @@ async def not_found_handler(request, exc):
 
 @app.exception_handler(500)
 async def internal_error_handler(request, exc):
+    logger.error(f"Internal server error: {str(exc)}")
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error", "error": str(exc)}
@@ -172,28 +198,26 @@ async def internal_error_handler(request, exc):
 # -----------------------
 # Routes
 # -----------------------
-@app.get("/", tags=["Health"])
-@app.head("/", tags=["Health"])  # Add HEAD method support
+@app.get("/", response_model=HealthResponse, tags=["Health"])
+@app.head("/", tags=["Health"])
 async def root():
-    return {
-        "message": "Vital Signs Prediction API",
-        "status": "running",
-        "model_loaded": vital_signs_predictor is not None,
-        "endpoints": {
-            "predict": "/predict (POST)",
-            "health": "/health (GET)",
-            "status": "/status (GET)",
-            "docs": "/docs (GET)"
-        }
-    }
+    """Root endpoint - API status"""
+    return HealthResponse(
+        status="running",
+        model_loaded=vital_signs_predictor is not None,
+        message="Vital Signs Prediction API is running"
+    )
 
-@app.get("/health", tags=["Health"])
-@app.head("/health", tags=["Health"])  # Add HEAD method support
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+@app.head("/health", tags=["Health"])
 async def health_check():
-    return {
-        "status": "healthy" if vital_signs_predictor else "unhealthy",
-        "model_loaded": vital_signs_predictor is not None
-    }
+    """Health check endpoint"""
+    is_healthy = vital_signs_predictor is not None
+    return HealthResponse(
+        status="healthy" if is_healthy else "unhealthy",
+        model_loaded=is_healthy,
+        message="All systems operational" if is_healthy else "Model not loaded"
+    )
 
 @app.post("/predict", response_model=VitalSignsResponse, tags=["Prediction"])
 async def predict_vital_signs(request: VitalSignsRequest, background_tasks: BackgroundTasks):
@@ -207,12 +231,12 @@ async def predict_vital_signs(request: VitalSignsRequest, background_tasks: Back
     if not vital_signs_predictor:
         raise HTTPException(
             status_code=503, 
-            detail="Predictor not initialized. Please try again later."
+            detail="Service unavailable: Predictor not initialized"
         )
     
     temp_file_path = None
     try:
-        print(f"🔄 Processing prediction request for URL: {request.video_url}")
+        logger.info(f"Processing prediction request for URL: {request.video_url[:50]}...")
         
         # Validate video URL
         if not request.video_url.startswith(('http://', 'https://')):
@@ -224,18 +248,25 @@ async def predict_vital_signs(request: VitalSignsRequest, background_tasks: Back
         # Predict vitals
         import time
         start_time = time.time()
-        print(f"🔍 Starting prediction with age={request.age}, gender={request.gender}")
+        logger.info(f"Starting prediction with age={request.age}, gender={request.gender}")
         
-        results = vital_signs_predictor.predict_from_video(
-            temp_file_path,
-            request.age,
-            request.gender
-        )
+        try:
+            results = vital_signs_predictor.predict_from_video(
+                temp_file_path,
+                request.age,
+                request.gender
+            )
+        except Exception as pred_error:
+            logger.error(f"Prediction error: {str(pred_error)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Prediction failed: {str(pred_error)}"
+            )
         
         processing_time = round(time.time() - start_time, 2)
         results['processing_time'] = processing_time
         
-        print(f"✅ Prediction completed in {processing_time}s")
+        logger.info(f"Prediction completed in {processing_time}s")
         
         # Schedule cleanup
         background_tasks.add_task(video_processor.cleanup_temp_file, temp_file_path)
@@ -247,12 +278,12 @@ async def predict_vital_signs(request: VitalSignsRequest, background_tasks: Back
             background_tasks.add_task(video_processor.cleanup_temp_file, temp_file_path)
         raise
     except Exception as e:
-        print(f"❌ Prediction error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         if temp_file_path:
             background_tasks.add_task(video_processor.cleanup_temp_file, temp_file_path)
         raise HTTPException(
             status_code=500, 
-            detail=f"Prediction failed: {str(e)}"
+            detail=f"Internal server error: {str(e)}"
         )
 
 @app.get("/status", tags=["Status"])
@@ -261,7 +292,8 @@ async def get_status():
     if not vital_signs_predictor:
         return {
             "status": "Model not loaded",
-            "error": "Predictor initialization failed"
+            "error": "Predictor initialization failed",
+            "model_loaded": False
         }
     return {
         "status": "Ready",
@@ -269,7 +301,8 @@ async def get_status():
         "supported_formats": ["mp4", "avi", "mov", "webm"],
         "max_video_size": "100MB (recommended)",
         "min_frames_required": 30,
-        "api_version": "1.0.0"
+        "api_version": "1.0.0",
+        "memory_usage": "Optimized for cloud deployment"
     }
 
 @app.options("/{path:path}")
@@ -284,7 +317,6 @@ async def options_handler(path: str):
         }
     )
 
-# Add a test endpoint for debugging
 @app.get("/test", tags=["Debug"])
 async def test_endpoint():
     """Test endpoint for debugging"""
@@ -293,21 +325,28 @@ async def test_endpoint():
         "predictor_status": vital_signs_predictor is not None,
         "environment": {
             "PORT": os.environ.get("PORT", "Not set"),
-            "python_version": sys.version,
+            "python_version": sys.version.split()[0],
         }
     }
+
+# Add a simple ping endpoint that responds immediately
+@app.get("/ping", tags=["Health"])
+async def ping():
+    """Simple ping endpoint for quick health checks"""
+    return {"message": "pong", "timestamp": __import__('time').time()}
 
 # -----------------------
 # Run app
 # -----------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    print(f"🚀 Starting server on port {port}")
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(
         "api:app",
         host="0.0.0.0",
         port=port,
         reload=False,
         log_level="info",
-        access_log=True
+        access_log=True,
+        timeout_keep_alive=30,  # Keep connections alive longer
     )
